@@ -456,13 +456,13 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
 
     if (activeChat.type === "direct") {
       const pubKeyData = await fetchPublicKey(activeChat.id);
-      receiverPublicKeys[activeChat.id] = await crypto.subtle.importKey(
-        "spki",
-        new Uint8Array(pubKeyData),
-        { name: "RSA-OAEP", hash: "SHA-256" },
-        true,
-        ["encrypt"]
-      );
+      console.log(`Public key (raw) for ${activeChat.id}:`, pubKeyData);
+      console.log(`Key length for ${activeChat.id}:`, pubKeyData?.length);
+      if (!pubKeyData) {
+        alert(`${activeChat.id} has not set up encryption keys yet.`);
+        throw new Error("Receiver missing public key");
+      }
+      receiverPublicKeys[activeChat.id] = await importPublicKeySpkiBase64(pubKeyData);
       return receiverPublicKeys;
     }
 
@@ -473,13 +473,11 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
       if (member.username !== user) {
         try {
           const pubKeyData = await fetchPublicKey(member.username);
-          receiverPublicKeys[member.username] = await crypto.subtle.importKey(
-            "spki",
-            new Uint8Array(pubKeyData),
-            { name: "RSA-OAEP", hash: "SHA-256" },
-            true,
-            ["encrypt"]
-          );
+          if (!pubKeyData) {
+            console.warn(`Member ${member.username} has no public key. Skipping.`);
+            continue;
+          }
+          receiverPublicKeys[member.username] = await importPublicKeySpkiBase64(pubKeyData);
         } catch (err) {
           console.warn(`Missing public key for ${member.username}. Skipping.`, err);
         }

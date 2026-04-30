@@ -3,7 +3,14 @@ export function toBase64(buf) {
 }
 
 export function fromBase64(b64) {
-  return Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  // Handle potential PEM headers or whitespace
+  const clean = b64
+    .replace("-----BEGIN PUBLIC KEY-----", "")
+    .replace("-----END PUBLIC KEY-----", "")
+    .replace("-----BEGIN PRIVATE KEY-----", "")
+    .replace("-----END PRIVATE KEY-----", "")
+    .replace(/\s/g, "");
+  return Uint8Array.from(atob(clean), c => c.charCodeAt(0));
 }
 
 export async function generateKeys() {
@@ -150,9 +157,16 @@ export async function encryptMessage(message, receiverPublicKeys) {
   );
 
   const rawKey = await crypto.subtle.exportKey("raw", aesKey);
+  console.log("AES exported key size:", rawKey.byteLength);
+  console.log("rawKey is ArrayBuffer:", rawKey instanceof ArrayBuffer);
 
   const encryptedKeys = {};
   for (const [username, pubKey] of Object.entries(receiverPublicKeys)) {
+    console.log(`Encrypting for: ${username}`);
+    console.log(`Key object:`, pubKey);
+    console.log(`Key type:`, pubKey.type);
+    console.log(`Key usages:`, pubKey.usages);
+    
     const encKey = await crypto.subtle.encrypt(
       { name:"RSA-OAEP" },
       pubKey,
