@@ -2,7 +2,6 @@ import React, { useEffect, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import {
   generateKeys,
-  exportPublicKey,
   encryptMessage,
   decryptMessage,
   decryptKeyBackup,
@@ -268,11 +267,6 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
         setKeys(prevKeys => prevKeys || keyPair);
         socket.emit("user_join");
 
-        if (keyPair.publicKey) {
-          const exported = await exportPublicKey(keyPair.publicKey);
-          socket.emit("send_public_key", { key: exported });
-        }
-        socket.emit("get_public_keys");
         socket.emit("get_groups");
       } catch (err) {
         console.error("Key initialization failed:", err);
@@ -281,8 +275,6 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
     }
 
     init();
-
-    const handleReceiveKeys = (receivedKeys) => setPublicKeys(receivedKeys);
 
     const messageFromPayload = async (data) => {
       if (data.deleted_for_everyone) {
@@ -416,7 +408,6 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
       }
     };
 
-    socket.on("receive_public_keys", handleReceiveKeys);
     socket.on("receive_message", handleReceiveMessage);
     socket.on("message_edited", handleMessageEdited);
     socket.on("message_deleted", handleMessageDeleted);
@@ -430,7 +421,6 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
 
     return () => {
       isMounted = false;
-      socket.off("receive_public_keys", handleReceiveKeys);
       socket.off("receive_message", handleReceiveMessage);
       socket.off("message_edited", handleMessageEdited);
       socket.off("message_deleted", handleMessageDeleted);
@@ -444,6 +434,16 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
     };
   }, [user, keyPassword]);
 
+  const fetchPublicKey = async (username) => {
+    const token = sessionStorage.getItem("token");
+    const res = await fetch(`${API_BASE_URL}/public-key/${username}`, {
+      headers: { Authorization: token }
+    });
+    if (!res.ok) throw new Error(`Public key not found for ${username}`);
+    const data = await res.json();
+    return data.public_key;
+  };
+
   const getReceiverPublicKeys = async () => {
     if (!keys || !activeChat) throw new Error("Chat is not ready");
 
@@ -455,10 +455,10 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
     }
 
     if (activeChat.type === "direct") {
-      if (!publicKeys[activeChat.id]) throw new Error(`Missing public key for ${activeChat.id}`);
+      const pubKeyData = await fetchPublicKey(activeChat.id);
       receiverPublicKeys[activeChat.id] = await crypto.subtle.importKey(
         "spki",
-        new Uint8Array(publicKeys[activeChat.id]),
+        new Uint8Array(pubKeyData),
         { name: "RSA-OAEP", hash: "SHA-256" },
         true,
         ["encrypt"]
@@ -471,17 +471,18 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
 
     for (const member of group.members) {
       if (member.username !== user) {
-        if (!publicKeys[member.username]) {
-          console.warn(`Missing public key for ${member.username}. Skipping.`);
-          continue;
+        try {
+          const pubKeyData = await fetchPublicKey(member.username);
+          receiverPublicKeys[member.username] = await crypto.subtle.importKey(
+            "spki",
+            new Uint8Array(pubKeyData),
+            { name: "RSA-OAEP", hash: "SHA-256" },
+            true,
+            ["encrypt"]
+          );
+        } catch (err) {
+          console.warn(`Missing public key for ${member.username}. Skipping.`, err);
         }
-        receiverPublicKeys[member.username] = await crypto.subtle.importKey(
-          "spki",
-          new Uint8Array(publicKeys[member.username]),
-          { name: "RSA-OAEP", hash: "SHA-256" },
-          true,
-          ["encrypt"]
-        );
       }
     }
 
