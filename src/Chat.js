@@ -59,6 +59,16 @@ function formatBytes(size) {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function formatMessageTime(dateStr) {
+  if (!dateStr) return "";
+  // Handle 'YYYY-MM-DD HH:MM:SS' or ISO strings
+  const cleanDateStr = dateStr.includes(" ") && !dateStr.includes("T")
+    ? dateStr.replace(" ", "T") + "Z"
+    : dateStr;
+  const date = new Date(cleanDateStr);
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true }).toLowerCase();
+}
+
 function fileKind(mimeType = "") {
   if (mimeType.startsWith("image/")) return "image";
   if (mimeType.startsWith("video/")) return "video";
@@ -126,7 +136,7 @@ function AttachmentPreview({ file }) {
   );
 }
 
-function Chat({ user, setUser, keyPassword, setKeyPassword }) {
+function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
   const [directUsers, setDirectUsers] = useState([]);
   const [groups, setGroups] = useState([]);
   const [activeChat, setActiveChat] = useState(null);
@@ -142,6 +152,11 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
   const [showProfileEdit, setShowProfileEdit] = useState(false);
   const [profileForm, setProfileForm] = useState({ display_name: "", bio: "", avatar: "" });
   const [keys, setKeys] = useState(null);
+  const [showSidebar, setShowSidebar] = useState(window.innerWidth <= 768);
+  const [showKebabMenu, setShowKebabMenu] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [activeMessage, setActiveMessage] = useState(null);
+  const [menuPosition, setMenuPosition] = useState(null);
 
   const [showCreateGroup, setShowCreateGroup] = useState(false);
   const [showManageMembers, setShowManageMembers] = useState(false);
@@ -163,6 +178,45 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
 
   useEffect(() => { keysRef.current = keys; }, [keys]);
   useEffect(() => { activeChatRef.current = activeChat; }, [activeChat]);
+
+  useEffect(() => {
+    const close = () => setActiveMessage(null);
+    window.addEventListener("click", close);
+    return () => window.removeEventListener("click", close);
+  }, []);
+
+  let pressTimer;
+  const openMenu = (e, msg) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const menuWidth = 200;
+    const menuHeight = 260;
+    let x = e.clientX;
+    let y = e.clientY;
+
+    if (x + menuWidth > window.innerWidth) x = window.innerWidth - menuWidth - 10;
+    if (y + menuHeight > window.innerHeight) y = window.innerHeight - menuHeight - 10;
+    if (x < 10) x = 10;
+    if (y < 10) y = 10;
+
+    setActiveMessage(msg);
+    setMenuPosition({ x, y });
+  };
+
+  const handleContextMenu = (e, msg) => {
+    e.preventDefault();
+    openMenu(e, msg);
+  };
+
+  const handleTouchStart = (e, msg) => {
+    const touch = e.touches[0];
+    const clientX = touch.clientX;
+    const clientY = touch.clientY;
+    pressTimer = setTimeout(() => {
+      openMenu({ clientX, clientY, stopPropagation: () => { }, preventDefault: () => { } }, msg);
+    }, 500);
+  };
+  const handleTouchEnd = () => clearTimeout(pressTimer);
 
   useEffect(() => {
     if (chatRef.current) {
@@ -188,7 +242,7 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
         });
         const backup = backupRes.ok ? await backupRes.json() : (backupRes.status === 409 ? await backupRes.json() : { error: "no_key" });
         const backupExists = !backup.error;
-        
+
         if (backup.version) setBackupVersion(backup.version);
 
         if (backup.error === "old_version_needs_migration") {
@@ -199,41 +253,86 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
           return;
         }
 
-        if (backupExists && keyPassword && !storedPriv) {
+        // if (backupExists && keyPassword && !storedPriv) {
+        //   try {
+        //     const privKey = await decryptKeyBackup(backup.encrypted_private_key, backup.salt, backup.iv, backup.checksum, backup.iterations, keyPassword);
+        //     const pubKey = backup.public_key ? await importPublicKeySpkiBase64(backup.public_key) : null;
+        //     keyPair = { privateKey: privKey, publicKey: pubKey };
+        //     const privB64 = await exportPrivateKeyPkcs8Base64(privKey);
+        //     sessionStorage.setItem("privateKey", privB64);
+        //     if (backup.public_key) sessionStorage.setItem("publicKey", backup.public_key);
+        //   } catch {
+        //     setKeyLoadError({
+        //       message: "Incorrect password or corrupted backup.",
+        //       action: "auth_failed"
+        //     });
+        //     return;
+        //   }
+        // }
+
+        if (!keyPair && storedPriv) {
           try {
-            const privKey = await decryptKeyBackup(backup.encrypted_private_key, backup.salt, backup.iv, backup.checksum, backup.iterations, keyPassword);
-            const pubKey = backup.public_key ? await importPublicKeySpkiBase64(backup.public_key) : null;
+            keyPair = {
+              privateKey: await importPrivateKeyPkcs8Base64(storedPriv),
+              publicKey: storedPub
+                ? await importPublicKeySpkiBase64(storedPub)
+                : null
+            };
+
+            // ✅ ADD THIS FIX HERE
+            if (!storedPub && backup.public_key) {
+              sessionStorage.setItem("publicKey", backup.public_key);
+              keyPair.publicKey = await importPublicKeySpkiBase64(backup.public_key);
+            }
+
+          } catch {
+            sessionStorage.removeItem("privateKey");
+            sessionStorage.removeItem("publicKey");
+
+            console.warn("Corrupted session key, falling back to backup...");
+          }
+        }
+
+        if (!keyPair && backupExists) {
+          if (!keyPassword && !storedPriv) {
+            setKeyLoadError({
+              message: "Please enter your password to unlock messages.",
+              action: "auth_required"
+            });
+            return;
+          }
+
+          try {
+            const privKey = await decryptKeyBackup(
+              backup.encrypted_private_key,
+              backup.salt,
+              backup.iv,
+              backup.checksum,
+              backup.iterations,
+              keyPassword
+            );
+
+            const pubKey = backup.public_key
+              ? await importPublicKeySpkiBase64(backup.public_key)
+              : null;
+
             keyPair = { privateKey: privKey, publicKey: pubKey };
+
             const privB64 = await exportPrivateKeyPkcs8Base64(privKey);
             sessionStorage.setItem("privateKey", privB64);
-            if (backup.public_key) sessionStorage.setItem("publicKey", backup.public_key);
-          } catch {
+            if (backup.public_key) {
+              sessionStorage.setItem("publicKey", backup.public_key);
+            }
+
+            setKeyLoadError(null);
+
+          } catch (err) {
             setKeyLoadError({
               message: "Incorrect password or corrupted backup.",
               action: "auth_failed"
             });
             return;
           }
-        }
-
-        if (!keyPair && storedPriv) {
-          try {
-            keyPair = {
-              privateKey: await importPrivateKeyPkcs8Base64(storedPriv),
-              publicKey: storedPub ? await importPublicKeySpkiBase64(storedPub) : null
-            };
-          } catch {
-            sessionStorage.removeItem("privateKey");
-            sessionStorage.removeItem("publicKey");
-          }
-        }
-
-        if (!keyPair && backupExists) {
-          setKeyLoadError({
-            message: "Your saved message key is protected. Please log out and log in again to unlock older messages.",
-            action: "auth_failed"
-          });
-          return;
         }
 
         if (!keyPair && backup.error === "no_key") {
@@ -243,7 +342,7 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
           const pubB64 = await exportPublicKeySpkiBase64(keyPair.publicKey);
           sessionStorage.setItem("privateKey", privB64);
           sessionStorage.setItem("publicKey", pubB64);
-          
+
           if (keyPassword) {
             const backupPayload = await encryptKeyBackup(keyPair.privateKey, keyPassword);
             await fetch(`${API_BASE_URL}/save-key`, {
@@ -253,9 +352,9 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
                 "Content-Type": "application/json"
               },
               body: JSON.stringify({
-                 ...backupPayload,
-                 version: 1,
-                 public_key: pubB64
+                ...backupPayload,
+                version: 1,
+                public_key: pubB64
               })
             });
           }
@@ -277,14 +376,19 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
     init();
 
     const messageFromPayload = async (data) => {
-      if (data.deleted_for_everyone) {
+      const isDeleted = data.deleted_for_everyone || data.status === "deleted";
+      if (isDeleted) {
         return {
           id: data.id,
           sender: data.sender,
           content: { kind: "deleted" },
           status: data.status || "sent",
           edited_at: data.edited_at || null,
-          deleted_for_everyone: true
+          deleted_for_everyone: true,
+          deleted_by: data.deleted_by,
+          edited: Boolean(data.edited),
+          reactions: data.reactions || {},
+          created_at: data.created_at || new Date().toISOString()
         };
       }
 
@@ -298,7 +402,11 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
           content: parseContent(text),
           status: data.status || "sent",
           edited_at: data.edited_at || null,
-          deleted_for_everyone: false
+          deleted_for_everyone: false,
+          deleted_by: data.deleted_by,
+          edited: Boolean(data.edited),
+          reactions: data.reactions || {},
+          created_at: data.created_at || new Date().toISOString()
         };
       } catch (err) {
         return {
@@ -307,7 +415,11 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
           content: { kind: "text", text: "Encrypted" },
           status: data.status || "sent",
           edited_at: data.edited_at || null,
-          deleted_for_everyone: false
+          deleted_for_everyone: false,
+          deleted_by: data.deleted_by,
+          edited: Boolean(data.edited),
+          reactions: data.reactions || {},
+          created_at: data.created_at || new Date().toISOString()
         };
       }
     };
@@ -324,7 +436,11 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
         const isActive = currentActive && currentActive.type === data.type && currentActive.id === targetId;
 
         if (isActive) {
-          setMessages(prev => [...prev, formatted]);
+          setMessages(prev => {
+            const ids = new Set(prev.map(m => m.id));
+            const incoming = [formatted];
+            return [...prev, ...incoming.filter(m => !ids.has(m.id))];
+          });
           if (data.type === "direct" && data.sender !== user) {
             socket.emit("messages_read", { sender: data.sender });
           }
@@ -351,7 +467,13 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
           nextContent = { kind: "text", text: "Encrypted" };
         }
         setMessages(prev => prev.map(m => (
-          m.id === data.id ? { ...m, content: nextContent, edited_at: data.edited_at } : m
+          m.id === data.id ? {
+            ...m,
+            content: nextContent,
+            edited_at: data.edited_at,
+            edited: true,
+            reactions: data.reactions || m.reactions
+          } : m
         )));
       } catch (err) {
         console.error("Edit decrypt failed:", err);
@@ -380,6 +502,12 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
         }
         return m;
       }));
+    };
+
+    const handleMessageReacted = (data) => {
+      setMessages(prev => prev.map(m => (
+        m.id === data.id ? { ...m, reactions: data.reactions } : m
+      )));
     };
 
     const handleUpdateUsers = (updatedUsers) => setDirectUsers(normalizeUsers(updatedUsers));
@@ -411,6 +539,7 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
     socket.on("receive_message", handleReceiveMessage);
     socket.on("message_edited", handleMessageEdited);
     socket.on("message_deleted", handleMessageDeleted);
+    socket.on("message_reacted", handleMessageReacted);
     socket.on("update_users", handleUpdateUsers);
     socket.on("receive_groups", handleReceiveGroups);
     socket.on("group_added", handleGroupAdded);
@@ -424,6 +553,7 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
       socket.off("receive_message", handleReceiveMessage);
       socket.off("message_edited", handleMessageEdited);
       socket.off("message_deleted", handleMessageDeleted);
+      socket.off("message_reacted", handleMessageReacted);
       socket.off("update_users", handleUpdateUsers);
       socket.off("receive_groups", handleReceiveGroups);
       socket.off("group_added", handleGroupAdded);
@@ -501,17 +631,19 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
       });
       const history = await res.json();
 
-      if (history.error) throw new Error(history.error);
-
-      const formattedHistory = await Promise.all(history.map(async msg => {
+      if (history.error) throw new Error(history.error);       const formattedHistory = await Promise.all(history.map(async msg => {
         const sender = msg[0];
         const id = msg[6];
         const status = msg[7] || "sent";
         const edited_at = msg[8] || null;
         const deleted_for_everyone = Boolean(msg[9]);
+        const deleted_by = msg[10];
+        const edited = Boolean(msg[11]);
+        const reactions = msg[12] ? JSON.parse(msg[12]) : {};
+        const created_at = msg[5];
 
         if (deleted_for_everyone) {
-          return { id, sender, content: { kind: "deleted" }, status, edited_at, deleted_for_everyone };
+          return { id, sender, content: { kind: "deleted" }, status, edited_at, deleted_for_everyone, deleted_by, edited, reactions, created_at };
         }
 
         try {
@@ -521,12 +653,17 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
             iv: JSON.parse(msg[4])
           };
           const text = await decryptMessage(data, keys.privateKey, user);
-          return { id, sender, content: parseContent(text), status, edited_at, deleted_for_everyone };
+          return { id, sender, content: parseContent(text), status, edited_at, deleted_for_everyone, deleted_by, edited, reactions, created_at };
         } catch {
-          return { id, sender, content: { kind: "text", text: "Encrypted" }, status, edited_at, deleted_for_everyone };
+          return { id, sender, content: { kind: "text", text: "Encrypted" }, status, edited_at, deleted_for_everyone, deleted_by, edited, reactions, created_at };
         }
       }));
-      setMessages(formattedHistory);
+      
+      setMessages(prev => {
+        const ids = new Set(prev.map(m => m.id));
+        const incoming = formattedHistory;
+        return [...prev, ...incoming.filter(m => !ids.has(m.id))].sort((a,b) => (a.id || 0) - (b.id || 0));
+      });
     } catch (err) {
       console.error("Error fetching history:", err);
       setMessages([{ sender: "System", content: { kind: "text", text: "Failed to load messages." } }]);
@@ -538,6 +675,7 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
     setEditingMessage(null);
     setMessage("");
     setSelectedFile(null);
+    setShowSidebar(false);
     fetchConversation(type, id);
     if (type === "direct" && unread[`direct:${id}`]) {
       socket.emit("messages_read", { sender: id });
@@ -646,6 +784,32 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
     socket.emit("delete_message", { id: msg.id, mode });
   };
 
+  const handleReact = (msgId, emoji) => {
+    // Optimistic Update
+    setMessages(prev => prev.map(m => {
+      if (m.id !== msgId) return m;
+      const reactions = { ...m.reactions };
+      const entry = { ...(reactions[emoji] || { count: 0, users: [] }) };
+      const users = [...entry.users];
+
+      if (users.includes(user)) {
+        const idx = users.indexOf(user);
+        users.splice(idx, 1);
+      } else {
+        users.push(user);
+      }
+
+      if (users.length > 0) {
+        reactions[emoji] = { count: users.length, users };
+      } else {
+        delete reactions[emoji];
+      }
+      return { ...m, reactions };
+    }));
+
+    socket.emit("react_message", { id: msgId, emoji });
+  };
+
   const handleLogout = () => {
     sessionStorage.removeItem("privateKey");
     sessionStorage.removeItem("publicKey");
@@ -665,14 +829,14 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
   };
 
   const handleResetKeys = async () => {
-    if (!window.confirm("Are you sure? Old messages encrypted with previous keys will not be readable.")) return;
+    if (!window.confirm("This will permanently prevent you from reading existing messages. Continue?")) return;
     const token = sessionStorage.getItem("token");
     const generated = await generateKeys();
     const privB64 = await exportPrivateKeyPkcs8Base64(generated.privateKey);
     const pubB64 = await exportPublicKeySpkiBase64(generated.publicKey);
     sessionStorage.setItem("privateKey", privB64);
     sessionStorage.setItem("publicKey", pubB64);
-    
+
     if (keyPassword) {
       const backupPayload = await encryptKeyBackup(generated.privateKey, keyPassword);
       await fetch(`${API_BASE_URL}/save-key`, {
@@ -681,7 +845,7 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
         body: JSON.stringify({ ...backupPayload, version: backupVersion + 1, public_key: pubB64 })
       });
     }
-    
+
     window.location.reload();
   };
 
@@ -692,7 +856,7 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
   const renderAvatar = (userObj) => {
     if (userObj.avatar && userObj.avatar.length > 2) { // URL or Base64
       if (userObj.avatar.startsWith("http") || userObj.avatar.startsWith("data:")) {
-         return <img src={userObj.avatar} alt="avatar" className="avatar-img" />;
+        return <img src={userObj.avatar} alt="avatar" className="avatar-img" />;
       }
     }
     // Fallback to emoji or initials
@@ -702,13 +866,14 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
   const renderStatus = (status) => {
     if (status === "sent") return "✔";
     if (status === "delivered") return "✔✔";
-    if (status === "read") return <span style={{color:"#3b82f6"}}>✔✔</span>;
+    if (status === "read") return <span style={{ color: "#3b82f6" }}>✔✔</span>;
     return "✔";
   };
 
   const renderMessageContent = (msg) => {
     if (msg.content.kind === "deleted") {
-      return <span className="deleted-message">This message was deleted.</span>;
+      const deletedByText = msg.deleted_by ? ` (by ${msg.deleted_by})` : "";
+      return <span className="deleted-message">This message was deleted{deletedByText}.</span>;
     }
 
     if (msg.content.kind === "attachment") {
@@ -724,13 +889,24 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
   };
 
   return (
-    <div className="app-container">
-      <div className="sidebar">
+    <div className={`app-container ${activeChat ? "chat-active" : ""}`}>
+      <div className={`sidebar ${showSidebar ? "active" : ""}`}>
         <div className="sidebar-header">
           <h3>SecureChat <span>@{user}</span></h3>
-          <div>
-            <button className="secondary-btn" onClick={handleOpenProfile} style={{ marginRight: '5px' }}>Profile</button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            {activeChat && <button className="sidebar-close" onClick={() => setShowSidebar(false)} aria-label="Close sidebar">✕</button>}
             <button className="create-group-btn" onClick={() => setShowCreateGroup(true)} aria-label="Create group">+</button>
+
+            <div className="kebab-menu">
+              <button className="kebab-btn" onClick={() => setShowKebabMenu(!showKebabMenu)}>⋮</button>
+              {showKebabMenu && (
+                <div className="dropdown-menu">
+                  <button className="dropdown-item" onClick={() => { setShowSettings(true); setShowKebabMenu(false); }}>Settings</button>
+                  <button className="dropdown-item" onClick={() => { setShowProfileEdit(true); setShowKebabMenu(false); }}>Profile</button>
+                  <button className="dropdown-item" onClick={handleLogout}>Logout</button>
+                </div>
+              )}
+            </div>
           </div>
         </div>
 
@@ -785,12 +961,18 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
           </div>
         </div>
 
-        <button className="logout-btn" onClick={handleLogout}>
-          Logout
-        </button>
       </div>
 
       <div className="chat-area">
+        <button className="sidebar-toggle" onClick={() => {
+          if (activeChat && window.innerWidth <= 768) {
+            setActiveChat(null);
+          } else {
+            setShowSidebar(!showSidebar);
+          }
+        }} aria-label="Toggle sidebar">
+          {(activeChat && window.innerWidth <= 768) ? "←" : "☰"}
+        </button>
         {keyLoadError && (
           <div className="key-error">
             <p>{keyLoadError.message}</p>
@@ -802,14 +984,15 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
         )}
         {!activeChat ? (
           <div className="no-chat-selected">
-            <h2>Select a user or group to start chatting</h2>
+            <h2>Select a conversation to start messaging</h2>
+            <p style={{ color: 'var(--text-muted)', fontSize: '13px' }}>Your messages are end-to-end encrypted</p>
           </div>
         ) : (
           <>
-            <div className="chat-header">
+            <div className="chat-header mobile-header-spacing">
               <div style={{ display: 'flex', alignItems: 'center' }}>
                 {activeChat.type === "direct" && activeDirectUser && (
-                   <div className="avatar-circle" style={{ marginRight: '10px', width: '32px', height: '32px' }}>{renderAvatar(activeDirectUser)}</div>
+                  <div className="avatar-circle" style={{ marginRight: '10px', width: '32px', height: '32px' }}>{renderAvatar(activeDirectUser)}</div>
                 )}
                 <div>
                   <h3>
@@ -822,9 +1005,11 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
                   </span>
                 </div>
               </div>
-              {activeChat.type === "group" && (
-                <button className="secondary-btn" onClick={() => setShowManageMembers(true)}>Manage Members</button>
-              )}
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                {activeChat.type === "group" && (
+                  <button className="secondary-btn" onClick={() => setShowManageMembers(true)}>Manage Members</button>
+                )}
+              </div>
             </div>
 
             <div className="messages-container" ref={chatRef}>
@@ -834,21 +1019,45 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
                 const canDeleteEveryone = isMine && !m.deleted_for_everyone;
                 return (
                   <div key={m.id || i} className={`message-row ${isMine ? "mine" : "others"}`}>
-                    <div className={`message-bubble ${isMine ? "mine" : "others"}`}>
-                      {!isMine && <div className="message-sender">{m.sender}</div>}
-                      {renderMessageContent(m)}
-                      <div className="message-footer">
-                        {m.edited_at && !m.deleted_for_everyone && <span>Edited</span>}
-                        {isMine && activeChat?.type === "direct" && !m.deleted_for_everyone ? renderStatus(m.status) : null}
+                    <div
+                      className={`message-bubble ${isMine ? "mine" : "others"}`}
+                      onContextMenu={(e) => handleContextMenu(e, m)}
+                      onTouchStart={(e) => {
+                        e.preventDefault();
+                        handleTouchStart(e, m);
+                      }}
+                      onTouchEnd={handleTouchEnd}
+                    >
+                      {!isMine && activeChat?.type === "group" && <div className="message-sender">{m.sender}</div>}
+                      {!m.deleted_for_everyone && (
+                        <div className="dropdown-arrow" onClick={(e) => openMenu(e, m)}>⌄</div>
+                      )}
+                      <div className="message-content-wrapper">
+                        {renderMessageContent(m)}
+                        <div className="message-meta-inline">
+                          <span className="message-time">{formatMessageTime(m.created_at)}</span>
+                          {isMine && activeChat?.type === "direct" && !m.deleted_for_everyone ? (
+                            <span className="message-status-ticks">{renderStatus(m.status)}</span>
+                          ) : null}
+                        </div>
                       </div>
+                      {m.reactions && Object.keys(m.reactions).length > 0 && (
+                        <div className="message-reactions">
+                          {Object.entries(m.reactions).map(([emoji, entry]) => {
+                            const count = entry?.count || (Array.isArray(entry) ? entry.length : 0);
+                            const users = entry?.users || (Array.isArray(entry) ? entry : []);
+                            return count > 0 && (
+                              <span key={emoji} className="reaction-badge reaction-pop" title={users.join(", ")}>
+                                {emoji} {count}
+                              </span>
+                            );
+                          })}
+                        </div>
+                      )}
+                      {m.edited && !m.deleted_for_everyone && (
+                        <div className="message-edited-tag">Edited</div>
+                      )}
                     </div>
-                    {!m.deleted_for_everyone && (
-                      <div className="message-actions">
-                        {canEdit && <button type="button" onClick={() => startEditing(m)}>Edit</button>}
-                        <button type="button" onClick={() => deleteMessage(m, "me")}>Delete for me</button>
-                        {canDeleteEveryone && <button type="button" onClick={() => deleteMessage(m, "everyone")}>Delete for everyone</button>}
-                      </div>
-                    )}
                   </div>
                 );
               })}
@@ -882,8 +1091,8 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
                 onChange={e => setSelectedFile(e.target.files?.[0] || null)}
                 disabled={Boolean(editingMessage)}
               />
-              <button type="button" className="attach-btn" onClick={() => fileInputRef.current?.click()} disabled={Boolean(editingMessage)}>
-                Attach
+              <button type="button" className="attach-btn" onClick={() => fileInputRef.current?.click()} disabled={Boolean(editingMessage)} title="Attach file">
+                📎
               </button>
               <input
                 value={message}
@@ -1007,6 +1216,56 @@ function Chat({ user, setUser, keyPassword, setKeyPassword }) {
               <button onClick={() => setShowManageMembers(false)}>Close</button>
             </div>
           </div>
+        </div>
+      )}
+
+      {showSettings && (
+        <div className="modal-overlay">
+          <div className="modal">
+            <h2>Settings</h2>
+            <div className="settings-option">
+              <label>Appearance</label>
+              <div className="theme-options">
+                <button className={`theme-btn ${theme === 'light' ? 'active' : ''}`} onClick={() => setTheme('light')}>Light</button>
+                <button className={`theme-btn ${theme === 'dark' ? 'active' : ''}`} onClick={() => setTheme('dark')}>Dark</button>
+                <button className={`theme-btn ${theme === 'system' ? 'active' : ''}`} onClick={() => setTheme('system')}>System Default</button>
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button onClick={() => setShowSettings(false)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {activeMessage && menuPosition && (
+        <div
+          className="floating-context-menu"
+          style={{
+            position: "fixed",
+            top: menuPosition.y,
+            left: menuPosition.x,
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {!activeMessage.deleted_for_everyone && (
+            <div className="menu-reaction-bar">
+              {["👍", "❤️", "😂", "😮", "😢", "🔥"].map(emoji => (
+                <button key={emoji} onClick={() => { handleReact(activeMessage.id, emoji); setActiveMessage(null); }}>{emoji}</button>
+              ))}
+            </div>
+          )}
+          {activeMessage.sender === user && !activeMessage.deleted_for_everyone && (
+            <>
+              <div className="menu-item" onClick={() => { startEditing(activeMessage); setActiveMessage(null); }}>Edit</div>
+              <div className="menu-item delete-all" onClick={() => {
+                if (window.confirm("Are you sure you want to delete this message for everyone?")) {
+                  deleteMessage(activeMessage, "everyone");
+                }
+                setActiveMessage(null);
+              }}>Delete for everyone</div>
+            </>
+          )}
+          <div className="menu-item" onClick={() => { deleteMessage(activeMessage, "me"); setActiveMessage(null); }}>Delete for me</div>
         </div>
       )}
     </div>

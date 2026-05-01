@@ -55,6 +55,9 @@ function Login({ setUser, setKeyPassword }) {
   return (
     <div className="auth-container">
       <h2>{isSignup ? "Create Account" : "Welcome Back"}</h2>
+      <p style={{ color: 'var(--text-muted)', fontSize: '14px', marginBottom: '24px', marginTop: '-12px' }}>
+        {isSignup ? 'Join SecureChat — encrypted messaging' : 'End-to-end encrypted messaging'}
+      </p>
       
       {message.text && (
         <div className={`message ${message.type}`}>

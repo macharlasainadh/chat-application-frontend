@@ -3,6 +3,17 @@ export function toBase64(buf) {
 }
 
 export function fromBase64(b64) {
+  if (!b64) return new Uint8Array(0);
+  
+  // Handle cases where b64 might be an Array (legacy) or already a Uint8Array
+  if (b64 instanceof Uint8Array) return b64;
+  if (Array.isArray(b64)) return new Uint8Array(b64);
+  
+  if (typeof b64 !== 'string') {
+    console.error("fromBase64: expected string, received", typeof b64, b64);
+    return new Uint8Array(0);
+  }
+
   // Handle potential PEM headers or whitespace
   const clean = b64
     .replace("-----BEGIN PUBLIC KEY-----", "")
