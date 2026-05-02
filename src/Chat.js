@@ -253,6 +253,9 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
     async function init() {
       try {
         const token = sessionStorage.getItem("token");
+        const storedPwd = sessionStorage.getItem("keyPassword");
+        if (storedPwd && !keyPassword) setKeyPassword(storedPwd);
+
         socket.auth = { token };
         if (!socket.connected) socket.connect();
 
@@ -884,7 +887,34 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
       });
       if (res.ok) {
         const data = await res.json();
-        setChatPreviews(data);
+        
+        // Decrypt previews client-side
+        const decryptedData = await Promise.all(data.map(async (chat) => {
+          if (chat.deleted) return { ...chat, last_message: "Message deleted" };
+          if (!keysRef.current?.privateKey || !chat.last_message_raw) return chat;
+          
+          try {
+            const rawMsg = JSON.parse(chat.last_message_raw);
+            const rawKeys = JSON.parse(chat.enc_keys);
+            const rawIv = JSON.parse(chat.iv);
+            
+            if (rawMsg && rawMsg.kind === "attachment") {
+              return { ...chat, last_message: "📁 Attachment" };
+            }
+
+            const decrypted = await decryptMessage(
+              { message: rawMsg, key: rawKeys, iv: rawIv },
+              keysRef.current.privateKey,
+              user
+            );
+            return { ...chat, last_message: decrypted };
+          } catch (e) {
+            // Keep the fallback "🔒 Encrypted message"
+            return chat;
+          }
+        }));
+
+        setChatPreviews(decryptedData);
       }
     } catch (err) {
       console.error("Failed to fetch chat previews:", err);
@@ -1121,9 +1151,25 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
         {keyLoadError && (
           <div className="key-error">
             <p>{keyLoadError.message}</p>
-            <div style={{ marginTop: '10px', display: 'flex', gap: '10px' }}>
-              <button onClick={handleLogout} className="secondary-btn">Retry / Logout</button>
-              <button onClick={handleResetKeys} style={{ backgroundColor: '#dc3545', color: 'white', border: 'none', borderRadius: '4px', padding: '8px 16px', cursor: 'pointer' }}>Reset Keys (Wipes old history)</button>
+            <div style={{ marginTop: '10px', display: 'flex', flexWrap: 'wrap', gap: '10px', alignItems: 'center' }}>
+              {(keyLoadError.action === "auth_failed" || keyLoadError.action === "auth_required") && (
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <input 
+                    type="password" 
+                    placeholder="Backup Password" 
+                    className="auth-input"
+                    style={{ margin: 0, padding: '6px 10px', width: '200px' }}
+                    value={keyPassword}
+                    onChange={(e) => {
+                      setKeyPassword(e.target.value);
+                      sessionStorage.setItem("keyPassword", e.target.value);
+                    }}
+                  />
+                  <button onClick={() => window.location.reload()} className="primary-btn" style={{ margin: 0, padding: '6px 15px' }}>Unlock</button>
+                </div>
+              )}
+              <button onClick={handleLogout} className="secondary-btn" style={{ padding: '6px 12px' }}>Logout</button>
+              <button onClick={handleResetKeys} style={{ backgroundColor: 'transparent', color: '#ff6b6b', border: '1px solid #ff6b6b', borderRadius: '4px', padding: '6px 12px', fontSize: '12px', cursor: 'pointer' }}>Reset Keys (Wipes history)</button>
             </div>
           </div>
         )}
