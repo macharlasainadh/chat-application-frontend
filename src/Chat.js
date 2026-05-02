@@ -586,6 +586,7 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
       socket.off("user_typing", handleUserTyping);
       socket.off("message_status_update", handleStatusUpdate);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user, keyPassword]);
 
   const fetchPublicKey = async (username) => {
@@ -923,6 +924,7 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
 
   useEffect(() => {
     if (user) fetchChatPreviews();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
 
   const handleSearch = (val) => {
