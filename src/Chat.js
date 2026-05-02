@@ -902,7 +902,7 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
               {showKebabMenu && (
                 <div className="dropdown-menu">
                   <button className="dropdown-item" onClick={() => { setShowSettings(true); setShowKebabMenu(false); }}>Settings</button>
-                  <button className="dropdown-item" onClick={() => { setShowProfileEdit(true); setShowKebabMenu(false); }}>Profile</button>
+                  <button className="dropdown-item" onClick={() => { handleOpenProfile(); setShowKebabMenu(false); }}>Profile</button>
                   <button className="dropdown-item" onClick={handleLogout}>Logout</button>
                 </div>
               )}
@@ -1015,8 +1015,6 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
             <div className="messages-container" ref={chatRef}>
               {messages.map((m, i) => {
                 const isMine = m.sender === user;
-                const canEdit = isMine && m.content.kind === "text" && !m.deleted_for_everyone;
-                const canDeleteEveryone = isMine && !m.deleted_for_everyone;
                 return (
                   <div key={m.id || i} className={`message-row ${isMine ? "mine" : "others"}`}>
                     <div
