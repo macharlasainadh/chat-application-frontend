@@ -164,16 +164,24 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
   const [newGroupIcon, setNewGroupIcon] = useState("chat");
   const [newGroupMembers, setNewGroupMembers] = useState([]);
   const [memberToAdd, setMemberToAdd] = useState("");
+  const [chatPreviews, setChatPreviews] = useState([]);
+
+  const [searchTerm, setSearchTerm] = useState("");
+  const [searchResults, setSearchResults] = useState([]);
+  const [isSearching, setIsSearching] = useState(false);
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
 
   const keysRef = useRef(null);
   const activeChatRef = useRef(null);
   const chatRef = useRef(null);
   const typingTimeoutRef = useRef(null);
+  const typingDebounceRef = useRef(null);
+  const searchTimeoutRef = useRef(null);
   const fileInputRef = useRef(null);
 
   const activeGroup = activeChat?.type === "group" ? groups.find(g => g.id === activeChat.id) : null;
   const activeDirectUser = activeChat?.type === "direct"
-    ? directUsers.find(u => u.username === activeChat.id)
+    ? (directUsers.find(u => u.username === activeChat.id) || { username: activeChat.id, online: false })
     : null;
 
   useEffect(() => { keysRef.current = keys; }, [keys]);
@@ -220,9 +228,24 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
 
   useEffect(() => {
     if (chatRef.current) {
-      chatRef.current.scrollTop = chatRef.current.scrollHeight;
+      const { scrollTop, scrollHeight, clientHeight } = chatRef.current;
+      if (scrollHeight - scrollTop - clientHeight < 150) {
+        chatRef.current.scrollTop = chatRef.current.scrollHeight;
+      }
     }
   }, [messages]);
+
+  const handleScroll = (e) => {
+    const { scrollTop, scrollHeight, clientHeight } = e.target;
+    const isFarFromBottom = scrollHeight - scrollTop - clientHeight > 300;
+    setShowScrollToBottom(isFarFromBottom);
+  };
+
+  const scrollToBottom = () => {
+    if (chatRef.current) {
+      chatRef.current.scrollTo({ top: chatRef.current.scrollHeight, behavior: 'smooth' });
+    }
+  };
 
   useEffect(() => {
     let isMounted = true;
@@ -238,20 +261,14 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
         const storedPub = sessionStorage.getItem("publicKey");
 
         const backupRes = await fetch(`${API_BASE_URL}/get-key`, {
-          headers: { Authorization: token }
+          headers: { Authorization: `Bearer ${token}` }
         });
         const backup = backupRes.ok ? await backupRes.json() : (backupRes.status === 409 ? await backupRes.json() : { error: "no_key" });
         const backupExists = !backup.error;
 
         if (backup.version) setBackupVersion(backup.version);
 
-        if (backup.error === "old_version_needs_migration") {
-          setKeyLoadError({
-            message: "Your encryption keys are in an older format. Please reset your keys.",
-            action: "reset_required"
-          });
-          return;
-        }
+
 
         // if (backupExists && keyPassword && !storedPriv) {
         //   try {
@@ -430,16 +447,16 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
         const formatted = await messageFromPayload(data);
         if (!formatted) return;
 
-        const isGroup = data.type === "group";
-        const targetId = data.sender === user ? (isGroup ? data.group_id : data.receiver_user) : (isGroup ? data.group_id : data.sender);
+        const isGroup = data.chat_type === "group";
+        const targetId = isGroup ? data.chat_id : (data.sender === user ? data.chat_id : data.sender);
         const chatKey = isGroup ? `group:${targetId}` : `direct:${targetId}`;
-        const isActive = currentActive && currentActive.type === data.type && currentActive.id === targetId;
+        const isActive = currentActive && currentActive.type === data.chat_type && currentActive.id === targetId;
 
         if (isActive) {
           setMessages(prev => {
             const ids = new Set(prev.map(m => m.id));
-            const incoming = [formatted];
-            return [...prev, ...incoming.filter(m => !ids.has(m.id))];
+            if (ids.has(formatted.id)) return prev;
+            return [...prev, formatted].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
           });
           if (data.type === "direct" && data.sender !== user) {
             socket.emit("messages_read", { sender: data.sender });
@@ -450,6 +467,7 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
             socket.emit("message_delivered", { id: data.id, sender: data.sender });
           }
         }
+        fetchChatPreviews(); // Update previews when message arrives
       } catch (err) {
         console.error("Decrypt failed:", err);
       }
@@ -475,6 +493,7 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
             reactions: data.reactions || m.reactions
           } : m
         )));
+        fetchChatPreviews(); // Update preview after edit
       } catch (err) {
         console.error("Edit decrypt failed:", err);
       }
@@ -488,6 +507,7 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
           m.id === data.id ? { ...m, content: { kind: "deleted" }, deleted_for_everyone: true } : m
         )));
       }
+      fetchChatPreviews(); // Update preview after deletion
     };
 
     const handleStatusUpdate = (update) => {
@@ -526,8 +546,9 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
       const currentActive = activeChatRef.current;
       if (!currentActive) return;
 
-      const isMatch = currentActive.type === data.type &&
-        (data.type === "group" ? currentActive.id === data.group_id : currentActive.id === data.sender);
+      const isGroup = data.chat_type === "group";
+      const isMatch = currentActive.type === data.chat_type &&
+        (isGroup ? currentActive.id === data.chat_id : currentActive.id === data.sender);
 
       if (isMatch && data.sender !== user) {
         setTypingUser(`${data.sender} is typing...`);
@@ -567,7 +588,7 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
   const fetchPublicKey = async (username) => {
     const token = sessionStorage.getItem("token");
     const res = await fetch(`${API_BASE_URL}/public-key/${username}`, {
-      headers: { Authorization: token }
+      headers: { Authorization: `Bearer ${token}` }
     });
     if (!res.ok) throw new Error(`Public key not found for ${username}`);
     const data = await res.json();
@@ -627,7 +648,7 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
     try {
       const endpoint = chatType === "group" ? `/messages/group/${chatId}` : `/messages/user/${chatId}`;
       const res = await fetch(`${API_BASE_URL}${endpoint}`, {
-        headers: { Authorization: token }
+        headers: { Authorization: `Bearer ${token}` }
       });
       const history = await res.json();
 
@@ -662,7 +683,7 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
       setMessages(prev => {
         const ids = new Set(prev.map(m => m.id));
         const incoming = formattedHistory;
-        return [...prev, ...incoming.filter(m => !ids.has(m.id))].sort((a,b) => (a.id || 0) - (b.id || 0));
+        return [...prev, ...incoming.filter(m => !ids.has(m.id))].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
       });
     } catch (err) {
       console.error("Error fetching history:", err);
@@ -706,7 +727,7 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
 
     const res = await fetch(`${API_BASE_URL}/upload`, {
       method: "POST",
-      headers: { Authorization: token },
+      headers: { Authorization: `Bearer ${token}` },
       body: formData
     });
 
@@ -760,11 +781,16 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
 
   const handleTyping = (e) => {
     setMessage(e.target.value);
-    if (activeChat && !editingMessage) {
+    if (activeChat && !editingMessage && !typingDebounceRef.current) {
       const payload = { type: activeChat.type };
       if (activeChat.type === "direct") payload.receiver_user = activeChat.id;
       else payload.group_id = activeChat.id;
+      
       socket.emit("typing", payload);
+      
+      typingDebounceRef.current = setTimeout(() => {
+        typingDebounceRef.current = null;
+      }, 500);
     }
   };
 
@@ -841,12 +867,73 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
       const backupPayload = await encryptKeyBackup(generated.privateKey, keyPassword);
       await fetch(`${API_BASE_URL}/save-key`, {
         method: "POST",
-        headers: { Authorization: token, "Content-Type": "application/json" },
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify({ ...backupPayload, version: backupVersion + 1, public_key: pubB64 })
       });
     }
 
     window.location.reload();
+  };
+
+  const fetchChatPreviews = async () => {
+    const token = sessionStorage.getItem("token");
+    if (!token) return;
+    try {
+      const res = await fetch(`${API_BASE_URL}/chat-list`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setChatPreviews(data);
+      }
+    } catch (err) {
+      console.error("Failed to fetch chat previews:", err);
+    }
+  };
+
+  useEffect(() => {
+    if (user) fetchChatPreviews();
+  }, [user]);
+
+  const handleSearch = (val) => {
+    setSearchTerm(val);
+    clearTimeout(searchTimeoutRef.current);
+
+    if (!val.trim() || val.length <= 1) {
+      setSearchResults([]);
+      setIsSearching(false);
+      return;
+    }
+
+    searchTimeoutRef.current = setTimeout(async () => {
+      setIsSearching(true);
+      try {
+        const token = sessionStorage.getItem("token");
+        const res = await fetch(`${API_BASE_URL}/search-users?q=${encodeURIComponent(val.trim())}`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        const data = await res.json();
+        console.log("Search API response:", data);
+
+        if (res.ok && Array.isArray(data)) {
+          setSearchResults(data);
+        } else {
+          console.error("Search error or unexpected format:", data);
+          setSearchResults([]);
+        }
+      } catch (err) {
+        console.error("Search failed:", err);
+        setSearchResults([]);
+      } finally {
+        setIsSearching(false);
+      }
+    }, 300);
+  };
+
+  const clearSearch = () => {
+    setSearchTerm("");
+    setSearchResults([]);
+    setIsSearching(false);
   };
 
   const getInitials = (name) => {
@@ -910,56 +997,114 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
           </div>
         </div>
 
-        <div className="sidebar-section">
-          <h4>DIRECT MESSAGES</h4>
-          <div className="users-list">
-            {directUsers.map(u => {
-              const unreadKey = `direct:${u.username}`;
-              return (
-                <button
-                  type="button"
-                  className={`user-item ${activeChat?.type === "direct" && activeChat.id === u.username ? "active" : ""}`}
-                  key={u.username}
-                  onClick={() => handleChatClick("direct", u.username)}
-                >
-                  <div style={{ position: 'relative' }}>
-                    <div className="avatar-circle">{renderAvatar(u)}</div>
-                    <span className={`status-indicator ${u.online ? "online" : "offline"}`} style={{ position: 'absolute', bottom: -2, right: -2 }}></span>
-                  </div>
-                  <span className="user-copy" style={{ marginLeft: '10px' }}>
-                    <span>{u.display_name || u.username} {u.username === user && "(You)"}</span>
-                    <small style={{ opacity: 0.8 }}>{u.bio ? u.bio : (u.online ? "Online" : formatLastSeen(u.last_seen))}</small>
-                  </span>
-                  {unread[unreadKey] > 0 && <span className="unread-badge">{unread[unreadKey]}</span>}
-                </button>
-              );
-            })}
-          </div>
+        <div className="sidebar-search">
+          <input
+            type="text"
+            placeholder="Search users..."
+            value={searchTerm}
+            onChange={(e) => handleSearch(e.target.value)}
+          />
         </div>
 
-        <div className="sidebar-section">
-          <h4>GROUPS</h4>
-          <div className="users-list">
-            {groups.map(g => {
-              const unreadKey = `group:${g.id}`;
-              return (
-                <button
-                  type="button"
-                  className={`user-item ${activeChat?.type === "group" && activeChat.id === g.id ? "active" : ""}`}
-                  key={g.id}
-                  onClick={() => handleChatClick("group", g.id)}
-                >
-                  <span className="group-icon">{g.icon}</span>
-                  <span className="user-copy">
-                    <span>{g.name}</span>
-                    <small>{g.members.length} members</small>
-                  </span>
-                  {unread[unreadKey] > 0 && <span className="unread-badge">{unread[unreadKey]}</span>}
-                </button>
-              );
-            })}
+        {searchTerm.length >= 2 && (
+          <div className="sidebar-section">
+            <div className="search-results-label">
+              <h4>SEARCH RESULTS</h4>
+              <button onClick={clearSearch}>Clear</button>
+            </div>
+            <div className="users-list">
+              {isSearching ? (
+                <div style={{ padding: '10px', fontSize: '13px', color: 'var(--text-muted)' }}>Searching...</div>
+              ) : searchResults.length === 0 ? (
+                <div style={{ padding: '10px', fontSize: '13px', color: 'var(--text-muted)' }}>No users found</div>
+              ) : (
+                searchResults.map(resultUsername => (
+                  <button
+                    type="button"
+                    className={`user-item ${activeChat?.type === "direct" && activeChat.id === resultUsername ? "active" : ""}`}
+                    key={resultUsername}
+                    onClick={() => {
+                      handleChatClick("direct", resultUsername);
+                      clearSearch();
+                    }}
+                  >
+                    <div className="avatar-circle">{getInitials(resultUsername)}</div>
+                    <span className="user-copy" style={{ marginLeft: '10px' }}>
+                      <span>{resultUsername}</span>
+                      <small>New contact</small>
+                    </span>
+                  </button>
+                ))
+              )}
+            </div>
           </div>
-        </div>
+        )}
+
+        {searchTerm.length < 2 && (
+          <>
+            <div className="sidebar-section">
+              <h4>DIRECT MESSAGES</h4>
+              <div className="users-list">
+                {directUsers.map(u => {
+                  const unreadKey = `direct:${u.username}`;
+                  const preview = chatPreviews.find(p => p.username === u.username);
+                  return (
+                    <button
+                      type="button"
+                      className={`user-item ${activeChat?.type === "direct" && activeChat.id === u.username ? "active" : ""}`}
+                      key={u.username}
+                      onClick={() => handleChatClick("direct", u.username)}
+                    >
+                      <div style={{ position: 'relative' }}>
+                        <div className="avatar-circle">{renderAvatar(u)}</div>
+                        <span className={`status-indicator ${u.online ? "online" : "offline"}`} style={{ position: 'absolute', bottom: -2, right: -2 }}></span>
+                      </div>
+                      <span className="user-copy" style={{ marginLeft: '10px' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+                          <span style={{ fontWeight: 600 }}>{u.display_name || u.username} {u.username === user && "(You)"}</span>
+                          {preview && <small style={{ fontSize: '10px', opacity: 0.6 }}>{formatMessageTime(preview.time)}</small>}
+                        </div>
+                        <small style={{ opacity: 0.8, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '180px' }}>
+                          {preview ? (
+                            <>
+                              {preview.sender === user ? "You: " : ""}
+                              {preview.last_message}
+                            </>
+                          ) : (u.bio ? u.bio : (u.online ? "Online" : formatLastSeen(u.last_seen)))}
+                        </small>
+                      </span>
+                      {unread[unreadKey] > 0 && <span className="unread-badge">{unread[unreadKey]}</span>}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="sidebar-section">
+              <h4>GROUPS</h4>
+              <div className="users-list">
+                {groups.map(g => {
+                  const unreadKey = `group:${g.id}`;
+                  return (
+                    <button
+                      type="button"
+                      className={`user-item ${activeChat?.type === "group" && activeChat.id === g.id ? "active" : ""}`}
+                      key={g.id}
+                      onClick={() => handleChatClick("group", g.id)}
+                    >
+                      <span className="group-icon">{g.icon}</span>
+                      <span className="user-copy">
+                        <span>{g.name}</span>
+                        <small>{g.members.length} members</small>
+                      </span>
+                      {unread[unreadKey] > 0 && <span className="unread-badge">{unread[unreadKey]}</span>}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </>
+        )}
 
       </div>
 
@@ -1012,7 +1157,7 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
               </div>
             </div>
 
-            <div className="messages-container" ref={chatRef}>
+            <div className="messages-container" ref={chatRef} onScroll={handleScroll}>
               {messages.map((m, i) => {
                 const isMine = m.sender === user;
                 return (
@@ -1059,6 +1204,11 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
                   </div>
                 );
               })}
+              {showScrollToBottom && (
+                <button className="scroll-to-bottom" onClick={scrollToBottom} aria-label="Scroll to bottom">
+                  ↓
+                </button>
+              )}
             </div>
 
             {typingUser && <div className="typing-indicator">{typingUser}</div>}
@@ -1165,7 +1315,7 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
                 const token = sessionStorage.getItem("token");
                 await fetch(`${API_BASE_URL}/profile`, {
                   method: "POST",
-                  headers: { Authorization: token, "Content-Type": "application/json" },
+                  headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
                   body: JSON.stringify(profileForm)
                 });
                 setShowProfileEdit(false);
