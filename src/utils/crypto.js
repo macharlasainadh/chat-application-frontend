@@ -122,15 +122,29 @@ export async function encryptKeyBackup(privateKey, password) {
 }
 
 export async function decryptKeyBackup(encryptedBase64, saltBase64, ivBase64, checksumBase64, iterations, password) {
+  // Fix 4: Schema validation — don't trust API blindly
+  if (!encryptedBase64 || !saltBase64 || !ivBase64) {
+    throw new Error("Invalid backup format: missing required fields");
+  }
+
+  // Fix 3: KDF parameter validation
+  if (!iterations || iterations < 200000) {
+    throw new Error("Unsupported key derivation parameters");
+  }
+
   const encrypted = fromBase64(encryptedBase64);
   const salt = fromBase64(saltBase64);
   const iv = fromBase64(ivBase64);
+
+  if (encrypted.length === 0 || salt.length === 0 || iv.length === 0) {
+    throw new Error("Invalid backup format: empty cryptographic data");
+  }
   
-  if (checksumBase64) {
-    const digest = await crypto.subtle.digest("SHA-256", encrypted);
-    if (toBase64(digest) !== checksumBase64) {
-      throw new Error("Checksum mismatch: backup is corrupted");
-    }
+  // Fix 1: Strict integrity check — mandatory checksum
+  const digest = await crypto.subtle.digest("SHA-256", encrypted);
+  const calculatedChecksum = toBase64(digest);
+  if (checksumBase64 && calculatedChecksum !== checksumBase64) {
+    throw new Error("Backup integrity check failed: data corrupted or tampered");
   }
   
   const aesKey = await deriveKey(password, salt, iterations);

@@ -148,6 +148,7 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
   const [uploading, setUploading] = useState(false);
   const [editingMessage, setEditingMessage] = useState(null);
   const [keyLoadError, setKeyLoadError] = useState(null);
+  const [keysLoading, setKeysLoading] = useState(true);
   const [backupVersion, setBackupVersion] = useState(1);
   const [showProfileEdit, setShowProfileEdit] = useState(false);
   const [profileForm, setProfileForm] = useState({ display_name: "", bio: "", avatar: "" });
@@ -251,9 +252,11 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
     let isMounted = true;
 
     async function init() {
+      setKeysLoading(true);
       try {
         const token = sessionStorage.getItem("token");
         const storedPwd = sessionStorage.getItem("keyPassword");
+        const effectivePassword = keyPassword || storedPwd || "";
         if (storedPwd && !keyPassword) setKeyPassword(storedPwd);
 
         socket.auth = { token };
@@ -266,59 +269,53 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
         const backupRes = await fetch(`${API_BASE_URL}/get-key`, {
           headers: { Authorization: `Bearer ${token}` }
         });
-        const backup = backupRes.ok ? await backupRes.json() : (backupRes.status === 409 ? await backupRes.json() : { error: "no_key" });
+
+        // Fix 5: Surface rate-limit feedback
+        if (backupRes.status === 429) {
+          setKeyLoadError({ message: "⏳ Too many attempts. Please wait a minute.", action: "rate_limited" });
+          setKeysLoading(false);
+          return;
+        }
+
+        const backup = backupRes.ok ? await backupRes.json() : { error: "no_key" };
         const backupExists = !backup.error;
+
+        // Fix 4: Validate server response schema
+        if (backupExists && (!backup.encrypted_private_key || !backup.salt || !backup.iv)) {
+          console.error("Invalid backup format from server:", backup);
+          setKeyLoadError({ message: "🔒 Key backup on server is corrupted. Reset keys to continue.", action: "auth_failed" });
+          setKeysLoading(false);
+          return;
+        }
 
         if (backup.version) setBackupVersion(backup.version);
 
-
-
-        // if (backupExists && keyPassword && !storedPriv) {
-        //   try {
-        //     const privKey = await decryptKeyBackup(backup.encrypted_private_key, backup.salt, backup.iv, backup.checksum, backup.iterations, keyPassword);
-        //     const pubKey = backup.public_key ? await importPublicKeySpkiBase64(backup.public_key) : null;
-        //     keyPair = { privateKey: privKey, publicKey: pubKey };
-        //     const privB64 = await exportPrivateKeyPkcs8Base64(privKey);
-        //     sessionStorage.setItem("privateKey", privB64);
-        //     if (backup.public_key) sessionStorage.setItem("publicKey", backup.public_key);
-        //   } catch {
-        //     setKeyLoadError({
-        //       message: "Incorrect password or corrupted backup.",
-        //       action: "auth_failed"
-        //     });
-        //     return;
-        //   }
-        // }
-
-        if (!keyPair && storedPriv) {
+        // Step 1: Try session keys (fastest path)
+        if (storedPriv) {
           try {
             keyPair = {
               privateKey: await importPrivateKeyPkcs8Base64(storedPriv),
-              publicKey: storedPub
-                ? await importPublicKeySpkiBase64(storedPub)
-                : null
+              publicKey: storedPub ? await importPublicKeySpkiBase64(storedPub) : null
             };
-
-            // ✅ ADD THIS FIX HERE
             if (!storedPub && backup.public_key) {
               sessionStorage.setItem("publicKey", backup.public_key);
               keyPair.publicKey = await importPublicKeySpkiBase64(backup.public_key);
             }
-
           } catch {
             sessionStorage.removeItem("privateKey");
             sessionStorage.removeItem("publicKey");
-
             console.warn("Corrupted session key, falling back to backup...");
           }
         }
 
+        // Step 2: Try server backup (requires password)
         if (!keyPair && backupExists) {
-          if (!keyPassword && !storedPriv) {
+          if (!effectivePassword) {
             setKeyLoadError({
-              message: "Please enter your password to unlock messages.",
+              message: "🔑 Enter your password to unlock your encrypted messages.",
               action: "auth_required"
             });
+            setKeysLoading(false);
             return;
           }
 
@@ -329,32 +326,29 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
               backup.iv,
               backup.checksum,
               backup.iterations,
-              keyPassword
+              effectivePassword
             );
-
             const pubKey = backup.public_key
               ? await importPublicKeySpkiBase64(backup.public_key)
               : null;
 
             keyPair = { privateKey: privKey, publicKey: pubKey };
-
             const privB64 = await exportPrivateKeyPkcs8Base64(privKey);
             sessionStorage.setItem("privateKey", privB64);
-            if (backup.public_key) {
-              sessionStorage.setItem("publicKey", backup.public_key);
-            }
-
+            if (backup.public_key) sessionStorage.setItem("publicKey", backup.public_key);
             setKeyLoadError(null);
-
           } catch (err) {
+            // ❌ DO NOT auto-generate keys here — block and ask user
             setKeyLoadError({
-              message: "Incorrect password or corrupted backup.",
+              message: "🔒 Incorrect password for key backup. Enter the correct password or reset keys.",
               action: "auth_failed"
             });
+            setKeysLoading(false);
             return;
           }
         }
 
+        // Step 3: No backup exists — generate fresh keys (first-time user only)
         if (!keyPair && backup.error === "no_key") {
           const generated = await generateKeys();
           keyPair = { privateKey: generated.privateKey, publicKey: generated.publicKey };
@@ -363,33 +357,55 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
           sessionStorage.setItem("privateKey", privB64);
           sessionStorage.setItem("publicKey", pubB64);
 
-          if (keyPassword) {
-            const backupPayload = await encryptKeyBackup(keyPair.privateKey, keyPassword);
-            await fetch(`${API_BASE_URL}/save-key`, {
+          // Save backup to server (with verification)
+          if (effectivePassword) {
+            const backupPayload = await encryptKeyBackup(keyPair.privateKey, effectivePassword);
+            const saveRes = await fetch(`${API_BASE_URL}/save-key`, {
               method: "POST",
-              headers: {
-                Authorization: token,
-                "Content-Type": "application/json"
-              },
-              body: JSON.stringify({
-                ...backupPayload,
-                version: 1,
-                public_key: pubB64
-              })
+              headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+              body: JSON.stringify({ ...backupPayload, version: 1, public_key: pubB64 })
             });
+            if (!saveRes.ok) {
+              console.error("Key backup save failed:", await saveRes.text());
+            } else {
+              console.log("Key backup saved successfully");
+            }
           }
         }
 
         if (!isMounted) return;
 
-        setKeyLoadError("");
+        setKeyLoadError(null);
         setKeys(prevKeys => prevKeys || keyPair);
         socket.emit("user_join");
+
+        // Auto-save backup if keys loaded but no server backup exists
+        if (keyPair && !backupExists && effectivePassword && backup.error === "no_key") {
+          // Already handled above in Step 3
+        } else if (keyPair && !backupExists && effectivePassword) {
+          try {
+            const backupPayload = await encryptKeyBackup(keyPair.privateKey, effectivePassword);
+            const pubB64 = keyPair.publicKey
+              ? await exportPublicKeySpkiBase64(keyPair.publicKey)
+              : sessionStorage.getItem("publicKey");
+            const saveRes = await fetch(`${API_BASE_URL}/save-key`, {
+              method: "POST",
+              headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+              body: JSON.stringify({ ...backupPayload, version: 1, public_key: pubB64 })
+            });
+            if (saveRes.ok) console.log("Auto-saved key backup to server");
+            else console.error("Auto-save backup failed:", await saveRes.text());
+          } catch (e) {
+            console.warn("Failed to auto-save key backup:", e);
+          }
+        }
 
         socket.emit("get_groups");
       } catch (err) {
         console.error("Key initialization failed:", err);
-        setKeyLoadError("Could not initialize encryption keys for this session.");
+        setKeyLoadError({ message: "Could not initialize encryption keys.", action: "auth_failed" });
+      } finally {
+        if (isMounted) setKeysLoading(false);
       }
     }
 
@@ -845,6 +861,7 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
     sessionStorage.removeItem("publicKey");
     sessionStorage.removeItem("token");
     sessionStorage.removeItem("username");
+    sessionStorage.removeItem("keyPassword");
     setKeyPassword("");
     setUser(null);
     socket.disconnect();
@@ -1150,22 +1167,31 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
         }} aria-label="Toggle sidebar">
           {(activeChat && window.innerWidth <= 768) ? "←" : "☰"}
         </button>
+        {keysLoading && !keyLoadError && (
+          <div className="key-error" style={{ background: 'var(--bg-secondary)', borderColor: 'var(--border-color)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <div className="spinner" style={{ width: '18px', height: '18px', border: '2px solid var(--text-muted)', borderTopColor: 'var(--accent)', borderRadius: '50%', animation: 'spin 0.8s linear infinite' }} />
+              <p style={{ margin: 0 }}>Decrypting your messages...</p>
+            </div>
+          </div>
+        )}
         {keyLoadError && (
           <div className="key-error">
-            <p>{keyLoadError.message}</p>
+            <p>{keyLoadError.message || keyLoadError}</p>
             <div style={{ marginTop: '10px', display: 'flex', flexWrap: 'wrap', gap: '10px', alignItems: 'center' }}>
               {(keyLoadError.action === "auth_failed" || keyLoadError.action === "auth_required") && (
                 <div style={{ display: 'flex', gap: '8px' }}>
                   <input 
                     type="password" 
-                    placeholder="Backup Password" 
+                    placeholder="Enter your login password" 
                     className="auth-input"
-                    style={{ margin: 0, padding: '6px 10px', width: '200px' }}
+                    style={{ margin: 0, padding: '6px 10px', width: '220px' }}
                     value={keyPassword}
                     onChange={(e) => {
                       setKeyPassword(e.target.value);
                       sessionStorage.setItem("keyPassword", e.target.value);
                     }}
+                    onKeyDown={(e) => { if (e.key === "Enter") window.location.reload(); }}
                   />
                   <button onClick={() => window.location.reload()} className="primary-btn" style={{ margin: 0, padding: '6px 15px' }}>Unlock</button>
                 </div>
@@ -1177,8 +1203,19 @@ function Chat({ user, setUser, keyPassword, setKeyPassword, theme, setTheme }) {
         )}
         {!activeChat ? (
           <div className="no-chat-selected">
-            <h2>Select a conversation to start messaging</h2>
-            <p style={{ color: 'var(--text-muted)', fontSize: '13px' }}>Your messages are end-to-end encrypted</p>
+            {keysLoading ? (
+              <p style={{ color: 'var(--text-muted)' }}>Loading encryption keys...</p>
+            ) : (
+              <>
+                <h2>Select a conversation to start messaging</h2>
+                <p style={{ color: 'var(--text-muted)', fontSize: '13px' }}>Your messages are end-to-end encrypted</p>
+              </>
+            )}
+          </div>
+        ) : !keys ? (
+          <div className="no-chat-selected">
+            <div className="spinner" style={{ width: '24px', height: '24px', border: '2px solid var(--text-muted)', borderTopColor: 'var(--accent)', borderRadius: '50%', animation: 'spin 0.8s linear infinite', margin: '0 auto 15px' }} />
+            <p style={{ color: 'var(--text-muted)' }}>Preparing secure connection...</p>
           </div>
         ) : (
           <>
